@@ -6,21 +6,24 @@
 #define Ultra_Sig 6
 #define txPin 1 
 #define rxPin 0
-#define DEBUG true
-#define SENSITIVITY 5 //Sensitivity of sensor in CM
+#define DEBUG false
+#define SENSITIVITY 10 //Sensitivity of sensor in CM
 #define STABLE_SAMPLE_COUNT 3 //Number of samples before setting base level
 #define START_SAMPLE_DELAY 3
+#define enableBLESend false
+#define enableGSMSend true
 
 class BinProperties{
   private:
     BinProperties(){};//Static Constructor
     BinProperties(BinProperties const&);// Don't Implement
     void operator=(BinProperties const&); // Don't implement
-    char* deviceIMEI;
-    bool enableGSMSend = false;
-    bool enableBLESend = false;
+    char* deviceIMEI = "TESTUNIT";
     char* davidPhone = "+12267916646";
     char* twilioPhone = "+17806664662";
+    uint64_t sensorTimeoutLength = MINUTES(20);
+    float lastReading = FLT_MIN;
+    float messageThreshold = 20;
     void setBaseLevel(){
       //wait until steady state distance is achieved
       float temp = RFduino_temperature(CELSIUS) - 5; //offset device heating
@@ -55,9 +58,9 @@ class BinProperties{
     }
   public:
     bool isActive = false;
-    float baseLevel = 0.0;//Empty Distance in CM
-    float currentLevel = 0.0;//Distance in CM
-    float currentUsage = 0.0;//Usage in %
+    float baseLevel;//Empty Distance in CM
+    float currentLevel;//Distance in CM
+    float currentUsage;//Usage in %
     float temp;
 
   static BinProperties& getBinProperties(){
@@ -65,26 +68,32 @@ class BinProperties{
       return instance;// Instantiated on first use.
   }
   /**
-  uint64_t id = getdeviceIMEI();
+  uint64_t id = getDeviceID();
   Serial.print("Device ID:");
   Serial.print(getdeviceIMEILow(), HEX);
   Serial.print(getdeviceIMEIHigh(), HEX);
   Serial.printf("\r\nTemp= %f Dist= %f\r\n", temp, distance);
   */
   float getCurrentUsage(){
+    Serial.flush();
     this->temp = RFduino_temperature(CELSIUS) - 5;
     this->currentLevel = Ultra_Sample(this->temp);
-    this->currentUsage = (this->currentLevel/this->baseLevel)*100.0;
+    this->currentUsage = ((this->baseLevel-this->currentLevel)/this->baseLevel)*100.0;
+    Serial.flush();
     return this->currentUsage;
   }
   
   void initBin(){
-      Power_On_GSM();
-      Serial.flush();
-      this->deviceIMEI = getDeviceIMEI();
-      Serial.flush();
-      Power_Off_GSM();
-      Serial.flush();
+//TODO: properly get IMEI
+//      Power_On_GSM();
+//      Serial.flush();
+//      this->deviceIMEI = getDeviceIMEI();
+//      Serial.flush();
+//      Power_Off_GSM();
+//      Serial.flush();
+      if(DEBUG==true){
+        this->sensorTimeoutLength = SECONDS(10);
+      }
       this->setBaseLevel();
       this->isActive = true;
       //Establish the base level
@@ -99,46 +108,68 @@ class BinProperties{
   }
   
   char* statusMessage(){
-    char message[500];
-    int d = sprintf(message, "{deviceIMEI:\"%s\",Temp:%f,Level:%f,Dist:%f}",
-            this->deviceIMEI,
-            this->temp,
-            this->currentUsage,
-            this->currentLevel);
-    Serial.printf("{deviceIMEI:\"%s\",Temp:%f,Level:%f,Dist:%f}",
-            this->deviceIMEI,
-            this->temp,
-            this->currentUsage,
-            this->currentLevel);
-    Serial.flush();
+    char message[1000];
+    cleanBuffer(message,1000);
+    if(DEBUG==true){
+      Serial.printf("\r\n{DeviceID:\"%s\",Temp:%f,Level:%f,Dist:%f,BaseLevel:%f}\r\n",
+            this->deviceIMEI, this->temp, this->currentUsage, this->currentLevel, this->baseLevel);
+      Serial.flush();
+    }
+    int d = sprintf(message, "{DeviceID:'%s',Temp:%d,Level:%d,Dist:%d,BaseLevel:%d}",
+            this->deviceIMEI, (int)(this->temp*100), (int)(this->currentUsage*100), (int)(this->currentLevel*100), (int)(this->baseLevel*100));
     return message;
   }
   
   void mainLoop(){
     while(true){
-      this->getCurrentUsage();
-      if(this->enableBLESend){
+      RFduino_ULPDelay(this->sensorTimeoutLength);
+      this->currentUsage = this->getCurrentUsage();
+      char* message = this->statusMessage();
+      if(enableBLESend == true){
         RFduinoBLE.sendFloat(this->temp);
         RFduinoBLE.sendFloat(this->currentLevel);
       }
-      char* message = this->statusMessage();
       if(DEBUG == true){
-        Serial.print("CALLING TEST MESSAGE");
+        Serial.print("SENSED VALUE\r\n--------\r\n");
         this->sendTestMessageSerial(this->davidPhone,message);
+        Serial.flush();
+      }
+      //Change is below threshold, and there is still more than 20CM in the bin
+      //Do not report
+      if((this->lastReading - this->currentLevel) < this->messageThreshold && (this->currentLevel >= 20 && this->lastReading != this->currentLevel) ){
+        continue;
+      }
+      this->lastReading = this->currentLevel;
+      if(DEBUG == true){
+        Serial.print("\r\nMESSAGE BODY\r\n--------\r\n");
+        this->sendTestMessageSerial(this->davidPhone,message);
+        Serial.flush();
       }
       // David Skinner 226 791 6646
-      if(DEBUG == false && this->enableGSMSend == true){
+      if(DEBUG == false && enableGSMSend == true){
         Power_On_GSM();
-        Serial.flush();
-        sendSMS(this->davidPhone, message);
+        sendSMS(this->twilioPhone, message);
         Power_Off_GSM();
       }
-      RFduino_ULPDelay( SECONDS(30) );
     }
   }
   void beginOperation(){
     while(true){
       Serial.print("Starting Operation\r\n");
+      this->lastReading = this->baseLevel;
+      //Send first message - Registration
+      if(DEBUG == false && enableGSMSend == true){
+        this->currentUsage = this->getCurrentUsage();
+        char* message = this->statusMessage();
+        char initialMessage[1000];
+        sprintf(initialMessage,"Register Bin: %s\r\n %s",this->deviceIMEI,message);
+        Power_On_GSM();
+        sendSMS(this->davidPhone, initialMessage);
+        Power_Off_GSM();
+        Power_On_GSM();
+        sendSMS(this->twilioPhone, initialMessage);
+        Power_Off_GSM();
+      }
       this->mainLoop();
     }
   }
@@ -256,8 +287,8 @@ void Power_On_GSM() {
     Serial.print("AT\r\n");//syncronize transmission
     delay(1000);
   }
-  Serial.flush();
-  if(0 != checkSIM()) Serial.print("ERROR:checkSIMStatus\r\n\r\n");
+//  Serial.flush();
+//  if(0 != checkSIM()) Serial.print("ERROR:checkSIMStatus\r\n\r\n");
   Serial.flush();
   //Serial.flush();
   delay(1000);
@@ -280,14 +311,17 @@ void sendSync(){
 
 void sendSMS(char *number, char* message)
 {
-  sendSync();
+  Serial.flush();
   Serial.print("AT+CMGF=1\r\n");  // switch to message mode
+  delay(1000);
+  Serial.flush();
   char cmd[32];
   snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"\r\n", number);
   Serial.print(cmd);
   delay(1000);
   Serial.printf("%s",message);
   Serial.print((char)26);
+  
   delay(6000);
 }
 
